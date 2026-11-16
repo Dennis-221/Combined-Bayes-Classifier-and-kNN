@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>bayes/classifier</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="page">
+    <header class="page__header">
+      <span class="breadcrumb">bayes / classifier</span>
+    </header>
+
+    <main class="page__main">
+      <div class="intro">
+        <h1>Train a Bayes classifier.</h1>
+        <p>Upload a CSV, choose the column you want to predict, then train, evaluate and use a Naive Bayes model, one step at a time.</p>
+      </div>
+
+      <!-- ================= 01 UPLOAD ================= -->
+      <section class="pipeline-section" id="uploadSection">
+        <div class="pipeline-section__head">
+          <span class="pipeline-section__num">01</span>
+          <div>
+            <h2>Upload your data</h2>
+            <p>Drop a CSV file. It stays in memory on this server while you work through the steps.</p>
+          </div>
+        </div>
+
+        <section class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Upload CSV file">
+          <input type="file" id="fileInput" accept=".csv" hidden />
+          <div class="dropzone__content" id="dropzoneIdle">
+            <svg class="dropzone__icon" width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <path d="M18 4V24M18 4L11 11M18 4L25 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M6 24V28C6 29.1046 6.89543 30 8 30H28C29.1046 30 30 29.1046 30 28V24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <p class="dropzone__label">Drop a CSV file here, or click to browse</p>
+            <p class="dropzone__meta">.csv files up to 32 MB</p>
+          </div>
+          <div class="dropzone__content" id="dropzoneLoading" hidden>
+            <p class="dropzone__label">Reading file…</p>
+          </div>
+        </section>
+
+        <p class="notice notice--error" id="uploadError" role="alert" hidden></p>
+
+        <div class="upload-summary" id="uploadSummary" hidden>
+          <div class="result__row">
+            <span class="result__file" id="uploadFilename"></span>
+            <button class="btn btn--ghost" id="resetBtn" type="button">Upload another</button>
+          </div>
+          <div class="stats-row">
+            <div class="stat"><span class="stat__value" id="uploadRows">0</span><span class="stat__label">rows</span></div>
+            <div class="stat"><span class="stat__value" id="uploadCols">0</span><span class="stat__label">columns</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 02 EXPLORE ================= -->
+      <section class="pipeline-section is-locked" id="exploreSection">
+        <div class="pipeline-section__head">
+          <span class="pipeline-section__num">02</span>
+          <div>
+            <h2>Explore the dataset</h2>
+            <p>See its dimensions, each column's type and missing values, and a random sample of records. Click again for a new sample.</p>
+          </div>
+        </div>
+
+        <button class="jumbotron-btn" id="exploreBtn" type="button" disabled>
+          <span class="jumbotron-btn__label">Explore dataset</span>
+          <span class="jumbotron-btn__sub">Dimensions, types, missing values and sample records</span>
+        </button>
+
+        <p class="notice notice--error" id="exploreError" role="alert" hidden></p>
+
+        <div id="exploreResult" hidden>
+          <div class="stats-row" id="exploreStats"></div>
+          <div class="block">
+            <h3 class="block-title">Columns</h3>
+            <div id="exploreColumns"></div>
+          </div>
+          <div class="block">
+            <h3 class="block-title">Sample records</h3>
+            <div id="exploreSample"></div>
+            <p class="block-note" id="exploreSampleNote"></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 03 TARGET ================= -->
+      <section class="pipeline-section is-locked" id="targetSection">
+        <div class="pipeline-section__head">
+          <span class="pipeline-section__num">03</span>
+          <div>
+            <h2>Choose the target</h2>
+            <p>Pick the column to predict. We check how many records and features can be used and how the classes are spread.</p>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label class="field__label" for="targetSelect">Target variable</label>
+            <select class="control" id="targetSelect" disabled>
+              <option value="">Choose a column…</option>
+            </select>
+          </div>
+        </div>
+
+        <button class="jumbotron-btn" id="analyzeBtn" type="button" disabled>
+          <span class="jumbotron-btn__label">Analyze target and features</span>
+          <span class="jumbotron-btn__sub">Usable records, feature types and class distribution</span>
+        </button>
+
+        <p class="notice notice--error" id="targetError" role="alert" hidden></p>
+
+        <div id="targetResult" hidden>
+          <div class="notices" id="targetNotices" aria-live="polite"></div>
+          <div class="stats-row" id="targetStats"></div>
+          <div class="block">
+            <h3 class="block-title" id="distributionTitle">Target distribution</h3>
+            <div class="bars" id="distributionBars"></div>
+            <p class="block-note" id="distributionNote" hidden></p>
+          </div>
+          <div class="block">
+            <h3 class="block-title">Features used</h3>
+            <div id="featureLists"></div>
+          </div>
+          <div class="block" id="excludedBlock" hidden>
+            <h3 class="block-title">Columns left out</h3>
+            <ul class="excluded-list" id="excludedList"></ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 04 TRAIN ================= -->
+      <section class="pipeline-section is-locked" id="trainSection">
+        <div class="pipeline-section__head">
+          <span class="pipeline-section__num">04</span>
+          <div>
+            <h2>Train and evaluate</h2>
+            <p>Choose an algorithm and how much data to hold back for testing, then train it and see how it performs on the held-out records.</p>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label class="field__label" for="algorithmSelect">Algorithm</label>
+            <select class="control" id="algorithmSelect" disabled>
+              {% for key, label in algorithms %}
+              <option value="{{ key }}">{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="field">
+            <label class="field__label" for="testSizeSelect">Test split</label>
+            <select class="control" id="testSizeSelect" disabled>
+              {% for value in test_sizes %}
+              <option value="{{ value }}" {% if value == default_test_size %}selected{% endif %}>{{ (value * 100)|round|int }}% of records</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+
+        <div class="knn-options" id="knnOptions" hidden>
+          <div class="knn-options__head">
+            <span class="field__label" id="kLabel">Values of k to try</span>
+            <div class="presets">
+              <button class="link-btn" type="button" data-k-preset="odd">Odd values</button>
+              <button class="link-btn" type="button" data-k-preset="all">All</button>
+              <button class="link-btn" type="button" data-k-preset="none">Clear</button>
+            </div>
+          </div>
+          <div class="k-grid" id="kGrid" role="group" aria-labelledby="kLabel" data-max-k="{{ max_k }}"></div>
+          <p class="block-note" id="kSummary"></p>
+          <p class="block-note">Each value of k you run is recorded with its test error rate; run again to add more. Odd values avoid ties in two-class problems. When classes tie, the class that sorts first wins.</p>
+        </div>
+
+        <button class="jumbotron-btn" id="trainBtn" type="button" disabled>
+          <span class="jumbotron-btn__label" id="trainBtnLabel">Train model</span>
+          <span class="jumbotron-btn__sub" id="trainBtnSub">Fit on the training split, then evaluate on the test split</span>
+        </button>
+
+        <div class="notices" id="trainNotices" role="alert" aria-live="polite" hidden></div>
+
+        <div id="trainResult" hidden>
+          <div class="stats-row" id="trainStats"></div>
+          <p class="block-note block-note--top" id="trainSplitNote"></p>
+
+          <div id="knnBlocks" hidden>
+            <div class="block">
+              <div class="block-head">
+                <h3 class="block-title">Recorded error rates</h3>
+                <button class="btn btn--ghost" id="knnClearBtn" type="button">Clear recorded results</button>
+              </div>
+              <div id="knnRecords"></div>
+              <p class="block-note" id="knnRecordsNote"></p>
+            </div>
+
+            <button class="jumbotron-btn" id="plotBtn" type="button">
+              <span class="jumbotron-btn__label">Plot k against error rate</span>
+              <span class="jumbotron-btn__sub" id="plotBtnSub">Marks the lowest-error k and the elbow, and compares every recorded k with the elbow</span>
+            </button>
+            <p class="notice notice--error" id="plotError" role="alert" hidden></p>
+
+            <div id="knnPlotResult" hidden>
+              <div class="block">
+                <h3 class="block-title">Error rate against k</h3>
+                <div class="chart-wrap" id="knnChart"></div>
+                <ul class="legend" id="knnLegend"></ul>
+                <p class="block-note" id="knnElbowNote"></p>
+              </div>
+              <div class="block">
+                <h3 class="block-title" id="compareTitle">Comparison with the elbow point</h3>
+                <div class="stats-row stats-row--tight" id="compareTally"></div>
+                <div id="knnCompare"></div>
+                <p class="block-note">Error change is measured against the elbow k in percentage points of the test split. Negative means fewer mistakes than the elbow.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="block">
+            <div class="block-head">
+              <h3 class="block-title" id="performanceTitle">Performance on the test split</h3>
+              <div class="inline-field" id="detailKField" hidden>
+                <label class="field__label" for="detailK">Show results for k</label>
+                <select class="control control--small" id="detailK"></select>
+              </div>
+            </div>
+            <div class="metrics" id="metricCards"></div>
+            <p class="block-note" id="metricNote"></p>
+          </div>
+          <div class="block">
+            <h3 class="block-title">Per-class results</h3>
+            <div id="perClassTable"></div>
+          </div>
+          <div class="block">
+            <h3 class="block-title">Confusion matrix</h3>
+            <div id="confusionMatrix"></div>
+            <p class="block-note">Rows are the actual class and columns are the predicted class. Green cells are correct predictions; amber cells are mistakes.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 05 PREDICT ================= -->
+      <section class="pipeline-section is-locked" id="predictSection">
+        <div class="pipeline-section__head">
+          <span class="pipeline-section__num">05</span>
+          <div>
+            <h2>Predict a new instance</h2>
+            <p>Enter the feature values for a new record. A blank field is filled in with the training median (numbers) or most common value (categories).</p>
+          </div>
+        </div>
+
+        <div class="field-row" id="predictKRow" hidden>
+          <div class="field">
+            <label class="field__label" for="predictK">k (number of neighbors)</label>
+            <select class="control" id="predictK"></select>
+          </div>
+        </div>
+
+        <div class="predict-form" id="predictFields"></div>
+
+        <button class="jumbotron-btn" id="predictBtn" type="button" disabled>
+          <span class="jumbotron-btn__label">Predict class</span>
+          <span class="jumbotron-btn__sub">Classify this record with the trained model</span>
+        </button>
+
+        <div class="notices" id="predictErrors" role="alert" hidden></div>
+
+        <div class="prediction" id="predictResult" hidden>
+          <span class="prediction__label">Predicted class</span>
+          <span class="prediction__value" id="predictValue"></span>
+          <div class="bars" id="predictBars"></div>
+          <p class="block-note" id="predictExplain"></p>
+          <p class="block-note" id="predictNote" hidden></p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
