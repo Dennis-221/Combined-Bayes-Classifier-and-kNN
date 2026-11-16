@@ -189,6 +189,162 @@ class KNNClassifier(_MixedFeatures):
 
 
 # --------------------------------------------------------------------------
+# Ho-Kashyap
+# --------------------------------------------------------------------------
+# An update that leaves no positive error component (relative to the margins)
+# means the iteration has reached its fixed point.
+HK_NO_POSITIVE_TOLERANCE = 1e-7
+
+
+def ho_kashyap(Z, Z_pinv, sign, learning_rate, max_iterations, tolerance):
+    """One Ho-Kashyap run (Duda, Hart & Stork, Pattern Classification, ch. 5).
+
+    Z       design matrix, one row [1, x] per training record
+    Z_pinv  its pseudo-inverse
+    sign    +1 for records of the class being separated, -1 for the rest
+
+    Multiplying each row by its sign gives Y = diag(sign) Z. The goal is a weight
+    vector a and margins b > 0 with Y a = b, i.e. every record on the correct
+    side of the boundary. Repeat:
+
+        e = Y a - b              error between the boundary and the margins
+        b <- b + 2 eta e+        raise margins only where the error is positive
+        a <- Y+ b                refit the boundary by least squares
+
+    Why it stopped is reported in `status`:
+
+    * "converged"      every |e| <= tolerance, so Y a > 0: all training records
+                       are on the correct side.
+    * "not_separable"  e has no positive part yet is not zero. In exact
+                       arithmetic that proves no linear boundary exists.
+    * "max_iterations" neither happened within max_iterations updates.
+
+    For 0 < eta < 1 the squared error ||e||^2 never increases.
+    """
+    b = np.ones(len(sign))
+    a = Z_pinv @ (sign * b)
+    history = []
+    iterations = 0
+    while True:
+        e = sign * (Z @ a) - b
+        max_error = float(np.abs(e).max())
+        history.append(float(e @ e))
+        if max_error <= tolerance:
+            status = "converged"
+            break
+        e_pos = 0.5 * (e + np.abs(e))
+        if e_pos.max() <= HK_NO_POSITIVE_TOLERANCE * (1.0 + b.max()):
+            status = "not_separable"
+            break
+        if iterations >= max_iterations:
+            status = "max_iterations"
+            break
+        b = b + 2.0 * learning_rate * e_pos
+        a = Z_pinv @ (sign * b)
+        iterations += 1
+    return {
+        "weights": a,
+        "margins": b,
+        "status": status,
+        "iterations": iterations,
+        "max_error": max_error,
+        "criterion": history[-1],
+        "history": history,
+    }
+
+
+class HoKashyapClassifier(_MixedFeatures):
+    """Linear classifier trained with the Ho-Kashyap procedure.
+
+    * two classes   -> one discriminant g(x); g(x) > 0 means the second class
+                       (in sorted order), otherwise the first
+    * more classes  -> one discriminant per class against all the others
+                       (one-vs-rest); the class with the highest g(x) wins
+
+    Features are prepared like the other models: missing values filled from the
+    training data, numeric columns z-scored, categorical columns one-hot encoded
+    (a category not seen in training gets all zeros, i.e. the baseline).
+
+    Ho-Kashyap needs the classes to be linearly separable to converge. When they
+    are not, the final weights are still the best compromise the procedure
+    found; `runs_` records how each discriminant ended.
+    """
+
+    def __init__(self, numeric, categorical, learning_rate=0.5, max_iterations=5000, tolerance=1e-3):
+        super().__init__(numeric, categorical)
+        self.learning_rate = float(learning_rate)
+        self.max_iterations = int(max_iterations)
+        self.tolerance = float(tolerance)
+
+    def _design(self, X):
+        blocks = [np.ones((len(X), 1))]
+        if self.numeric:
+            blocks.append(self._scaled_numeric(X))
+        if self.categorical:
+            frame = self._categorical_frame(X)
+            for col in self.categorical:
+                levels = self.cat_levels_[col]
+                codes = pd.Index(levels).get_indexer(frame[col])  # -1 for a category not seen in training
+                onehot = np.zeros((len(X), len(levels)))
+                known = codes >= 0
+                onehot[np.flatnonzero(known), codes[known]] = 1.0
+                blocks.append(onehot)
+        return np.hstack(blocks)
+
+    def fit(self, X, y):
+        y = np.asarray(y, dtype=str)
+        self.classes_ = np.unique(y)
+        self._fit_features(X)
+        frame = self._categorical_frame(X)
+        self.cat_levels_ = {col: sorted(frame[col].unique()) for col in self.categorical}
+
+        Z = self._design(X)
+        self.n_dimensions_ = Z.shape[1] - 1  # encoded features, not counting the constant 1
+        # Y = diag(sign) Z, and diag(sign) is orthogonal, so Y+ = Z+ diag(sign):
+        # one pseudo-inverse serves every discriminant.
+        Z_pinv = np.linalg.pinv(Z, rcond=1e-10)
+
+        if len(self.classes_) == 2:
+            targets = [(self.classes_[1], str(self.classes_[0]))]
+        else:
+            targets = [(cls, "all other classes") for cls in self.classes_]
+
+        weights, self.runs_ = [], []
+        for cls, versus in targets:
+            sign = np.where(y == cls, 1.0, -1.0)
+            run = ho_kashyap(Z, Z_pinv, sign, self.learning_rate, self.max_iterations, self.tolerance)
+            weights.append(run["weights"])
+            self.runs_.append({
+                "label": str(cls),
+                "versus": versus,
+                "status": run["status"],
+                "iterations": run["iterations"],
+                "max_error": run["max_error"],
+                "criterion": run["criterion"],
+                # training records this boundary still puts on the wrong side (or exactly on it)
+                "train_errors": int((sign * (Z @ run["weights"]) <= 0).sum()),
+            })
+
+        self.weights_ = np.column_stack(weights)  # one column per discriminant
+        if not np.isfinite(self.weights_).all():
+            raise ValueError(
+                "The weights became non-finite. Try a smaller learning rate or fewer features."
+            )
+        return self
+
+    def decision_scores(self, X):
+        """Score per class for every row, aligned with classes_. The highest wins.
+        For two classes the scores are -g(x) and +g(x)."""
+        g = self._design(X) @ self.weights_
+        if len(self.classes_) == 2:
+            return np.column_stack([-g[:, 0], g[:, 0]])
+        return g
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.decision_scores(X), axis=1)]
+
+
+# --------------------------------------------------------------------------
 # Choosing k
 # --------------------------------------------------------------------------
 def choose_k(ks, error_counts):

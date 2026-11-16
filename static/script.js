@@ -189,6 +189,7 @@ function clearTrain() {
   $("trainResult").hidden = true;
   $("knnBlocks").hidden = true;
   $("knnPlotResult").hidden = true;
+  $("hkBlocks").hidden = true;
   hideInline($("plotError"));
   knnData = null;
   renderNotices($("trainNotices"));
@@ -625,13 +626,19 @@ document.querySelectorAll("[data-k-preset]").forEach((button) =>
   button.addEventListener("click", () => applyKPreset(button.dataset.kPreset))
 );
 
+const ALGORITHM_BUTTON = {
+  naive_bayes: ["Train model", "Fit on the training split, then evaluate on the test split"],
+  knn: ["Run KNN", "Record the test error rate for each selected k"],
+  ho_kashyap: ["Train Ho-Kashyap", "Find a linear boundary on the training split, then evaluate it on the test split"],
+};
+
 function onAlgorithmChange() {
-  const isKnn = $("algorithmSelect").value === "knn";
-  $("knnOptions").hidden = !isKnn;
-  $("trainBtnLabel").textContent = isKnn ? "Run KNN" : "Train model";
-  $("trainBtnSub").textContent = isKnn
-    ? "Record the test error rate for each selected k"
-    : "Fit on the training split, then evaluate on the test split";
+  const algorithm = $("algorithmSelect").value;
+  $("knnOptions").hidden = algorithm !== "knn";
+  $("hkOptions").hidden = algorithm !== "ho_kashyap";
+  const [label, sub] = ALGORITHM_BUTTON[algorithm];
+  $("trainBtnLabel").textContent = label;
+  $("trainBtnSub").textContent = sub;
 }
 
 $("algorithmSelect").addEventListener("change", () => {
@@ -654,6 +661,7 @@ function renderTrain(data) {
   knnData = null;
   $("knnBlocks").hidden = true;
   $("knnPlotResult").hidden = true;
+  $("hkBlocks").hidden = true;
   $("detailKField").hidden = true;
 
   renderNotices($("trainNotices"), { warnings: data.warnings });
@@ -774,6 +782,7 @@ function renderKnn(data) {
       "then records are compared by Euclidean distance."
   );
 
+  $("hkBlocks").hidden = true;
   $("knnBlocks").hidden = false;
   renderKnnRecords(data);
 
@@ -1123,7 +1132,110 @@ $("knnClearBtn").addEventListener("click", () =>
 );
 
 /* ============================================================
-   04 Train button (both algorithms)
+   04 Ho-Kashyap
+   ============================================================ */
+
+function hkStatus(d) {
+  if (d.status === "converged") return { text: "converged", tone: "chip--num" };
+  if (d.status === "not_separable") return { text: "not linearly separable", tone: "chip--warn" };
+  return d.train_errors === 0
+    ? { text: "iteration limit, separates data", tone: "chip--cat" }
+    : { text: "iteration limit reached", tone: "chip--warn" };
+}
+
+const HK_EXPLANATION = {
+  converged:
+    "Converged: the boundary puts every training record on the correct side, with a margin.",
+  not_separable:
+    "Not linearly separable: the Ho-Kashyap test shows that no straight boundary can separate these " +
+    "training records. The classifier uses the best compromise found, so expect mistakes even on the training data.",
+  limit_clean:
+    "Iteration limit, separates the training data: the boundary already classifies every training record " +
+    "correctly but had not yet reached the target margins. More iterations or a larger threshold lets it settle.",
+  limit_errors:
+    "Iteration limit reached: it had not converged yet. The classes may not be linearly separable, " +
+    "although more iterations could still help if they are.",
+};
+
+function renderHoKashyap(data) {
+  activeAlgorithm = "ho_kashyap";
+  knnData = null;
+  $("knnBlocks").hidden = true;
+  $("knnPlotResult").hidden = true;
+  $("detailKField").hidden = true;
+
+  renderNotices($("trainNotices"), { warnings: data.warnings });
+  $("trainStats").replaceChildren(
+    statCard(num(data.n_train), "training samples"),
+    statCard(num(data.n_test), "testing samples", "info"),
+    statCard(num(data.n_features), "features used"),
+    statCard(num(data.n_dimensions), "dimensions after encoding"),
+    statCard(pct(data.training_accuracy), "training accuracy")
+  );
+
+  const c = data.convergence;
+  const p = c.parameters;
+  $("trainSplitNote").textContent =
+    splitNote(data, `${data.algorithm}.`) +
+    ` Learning rate ${p.learning_rate}, up to ${num(p.max_iterations)} iterations, convergence threshold ${p.tolerance}.`;
+
+  $("hkTitle").textContent =
+    c.mode === "binary" ? "Convergence" : "Convergence of each one-vs-rest boundary";
+  $("hkConvergence").replaceChildren(
+    dataTable(
+      [
+        h("th", { text: "Boundary" }),
+        h("th", { text: "Result" }),
+        h("th", { class: "num", text: "Updates" }),
+        h("th", { class: "num", text: "Training errors" }),
+        h("th", { class: "num", text: "Largest error left" }),
+      ],
+      c.discriminants.map((d) => {
+        const status = hkStatus(d);
+        const name = `${d.label} versus ${d.versus}`;
+        return h(
+          "tr",
+          {},
+          h("td", { class: "name-cell", title: name, text: name }),
+          h("td", { class: "status-cell" }, h("span", { class: `chip ${status.tone}`, text: status.text })),
+          h("td", { class: "num", text: num(d.iterations) }),
+          h("td", { class: "num", text: `${num(d.train_errors)} of ${num(c.n_train)}` }),
+          h("td", { class: "num", text: d.max_error })
+        );
+      })
+    )
+  );
+
+  const present = new Set(
+    c.discriminants.map((d) =>
+      d.status === "converged" ? "converged" : d.status === "not_separable" ? "not_separable"
+        : d.train_errors === 0 ? "limit_clean" : "limit_errors"
+    )
+  );
+  fill(
+    $("hkConvergenceNote"),
+    ["converged", "not_separable", "limit_clean", "limit_errors"]
+      .filter((key) => present.has(key))
+      .map((key) => h("p", { class: "block-note", text: HK_EXPLANATION[key] }))
+  );
+  $("hkBlocks").hidden = false;
+
+  renderPerformance({
+    title: "Performance on the test split",
+    metrics: data.metrics,
+    baseline: data.baseline_accuracy,
+    perClass: data.per_class,
+    labels: data.labels,
+    matrix: data.confusion_matrix,
+  });
+  $("trainResult").hidden = false;
+
+  ensurePredictForm(data);
+  setLocked("predictSection", false);
+}
+
+/* ============================================================
+   04 Train button (all algorithms)
    ============================================================ */
 
 $("trainBtn").addEventListener("click", () =>
@@ -1141,6 +1253,13 @@ $("trainBtn").addEventListener("click", () =>
           return;
         }
         payload.params = { ks };
+      } else if (algorithm === "ho_kashyap") {
+        // an emptied field becomes NaN -> null, which the server reports as invalid
+        payload.params = {
+          learning_rate: parseFloat($("hkRate").value),
+          max_iterations: parseInt($("hkIterations").value, 10),
+          tolerance: parseFloat($("hkTolerance").value),
+        };
       }
 
       const { ok, data } = await postJSON("/train", payload);
@@ -1157,6 +1276,8 @@ $("trainBtn").addEventListener("click", () =>
         renderKnn(data);
         // keep an open plot in step with the newly recorded values
         if (!$("knnPlotResult").hidden) await loadCurve();
+      } else if (data.algorithm_key === "ho_kashyap") {
+        renderHoKashyap(data);
       } else {
         renderTrain(data);
       }
@@ -1232,19 +1353,42 @@ function ensurePredictForm(data) {
   }
 }
 
+const signed = (v) => `${v < 0 ? "\u2212" : "+"}${Math.abs(v).toFixed(3)}`;
+
 function renderPrediction(data) {
   $("predictValue").textContent = data.prediction;
-  fill(
-    $("predictBars"),
-    data.probabilities.map((p, i) =>
-      barRow(
-        p.label,
-        p.probability,
-        data.k ? `${p.votes} of ${data.k}  (${pctProb(p.probability)})` : pctProb(p.probability),
-        i === 0
+
+  const hasScores = Array.isArray(data.scores);
+  $("predictBars").hidden = hasScores;
+  $("predictScores").hidden = !hasScores;
+  if (hasScores) {
+    // discriminant scores are not probabilities, so they get a table rather than bars
+    $("predictScores").replaceChildren(
+      dataTable(
+        [h("th", { text: "Class" }), h("th", { class: "num", text: "Score" })],
+        data.scores.map((entry, i) =>
+          h(
+            "tr",
+            { class: i === 0 ? "row-optimal" : null },
+            h("td", { class: "k-cell" }, entry.label, i === 0 ? h("span", { class: "chip chip--num", text: "predicted" }) : null),
+            h("td", { class: "num", text: signed(entry.score) })
+          )
+        )
       )
-    )
-  );
+    );
+  } else {
+    fill(
+      $("predictBars"),
+      data.probabilities.map((p, i) =>
+        barRow(
+          p.label,
+          p.probability,
+          data.k ? `${p.votes} of ${data.k}  (${pctProb(p.probability)})` : pctProb(p.probability),
+          i === 0
+        )
+      )
+    );
+  }
   $("predictExplain").textContent = data.explanation;
 
   const filled = data.filled_columns;

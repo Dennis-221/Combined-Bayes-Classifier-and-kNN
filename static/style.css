@@ -1050,3 +1050,41 @@ tr.row-elbow td {
   background: #fff;
   border: 2px solid var(--ledger);
 }
+
+/* ============================================================
+   Ho-Kashyap: options, convergence table, score table
+   ============================================================ */
+
+.hk-options {
+  margin: 0 0 4px;
+}
+
+.block-note--flush {
+  margin: 0 0 14px;
+}
+
+.chip--warn {
+  color: var(--amber-ink);
+  background: var(--amber-bg);
+  border-color: #e8cfaa;
+}
+
+td.status-cell {
+  max-width: 320px;
+}
+
+td.status-cell .chip {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+td.name-cell {
+  white-space: normal;
+  min-width: 150px;
+  max-width: 280px;
+  overflow-wrap: anywhere;
+}
+
+.prediction .table-wrap {
+  margin-top: 4px;
+}

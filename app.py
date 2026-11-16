@@ -6,7 +6,7 @@ import pandas as pd
 from flask import Flask, jsonify, render_template, request
 from sklearn.model_selection import train_test_split
 
-from models import KNNClassifier, MixedNaiveBayes, choose_k, evaluate_predictions
+from models import HoKashyapClassifier, KNNClassifier, MixedNaiveBayes, choose_k, evaluate_predictions
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB upload cap
@@ -20,6 +20,9 @@ SMALL_DATASET_ROWS = 50   # below this we warn that metrics will be noisy
 IMBALANCE_RATIO = 10      # largest/smallest class ratio that triggers a warning
 MAX_K = 40                # KNN: k can be any whole number from 1 to this
 SLOW_KNN_ROWS = 50_000    # KNN: warn above this many training records
+HK_DEFAULTS = {"learning_rate": 0.5, "max_iterations": 5000, "tolerance": 0.001}
+HK_MAX_ITERATIONS = 100_000
+HK_MAX_WORK = 2e10        # Ho-Kashyap: refuse settings that would run for minutes
 RANDOM_STATE = 42
 TEST_SIZES = (0.1, 0.2, 0.25, 0.3)
 DEFAULT_TEST_SIZE = 0.2
@@ -29,6 +32,7 @@ DEFAULT_TEST_SIZE = 0.2
 ALGORITHMS = {
     "naive_bayes": "Naive Bayes (Gaussian + Categorical)",
     "knn": "K-nearest neighbors (KNN)",
+    "ho_kashyap": "Ho-Kashyap (linear discriminant)",
 }
 DEFAULT_ALGORITHM = "naive_bayes"
 
@@ -536,6 +540,148 @@ def knn_payload(bundle):
 
 
 # --------------------------------------------------------------------------
+# Ho-Kashyap
+# --------------------------------------------------------------------------
+def as_number(value):
+    """A finite float from a number or numeric string, otherwise None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def parse_hk_params(params):
+    """Validate the Ho-Kashyap settings. Returns (values, problems)."""
+    raw = params if isinstance(params, dict) else {}
+    values, problems = {}, []
+
+    rate = as_number(raw.get("learning_rate", HK_DEFAULTS["learning_rate"]))
+    if rate is None or not 0 < rate < 1:
+        problems.append("Learning rate must be a number greater than 0 and less than 1.")
+    else:
+        values["learning_rate"] = rate
+
+    iterations = as_number(raw.get("max_iterations", HK_DEFAULTS["max_iterations"]))
+    if iterations is None or not iterations.is_integer() or not 1 <= iterations <= HK_MAX_ITERATIONS:
+        problems.append(f"Maximum iterations must be a whole number from 1 to {HK_MAX_ITERATIONS:,}.")
+    else:
+        values["max_iterations"] = int(iterations)
+
+    tolerance = as_number(raw.get("tolerance", HK_DEFAULTS["tolerance"]))
+    if tolerance is None or not 1e-6 <= tolerance <= 0.5:
+        problems.append("Convergence threshold must be a number from 0.000001 to 0.5.")
+    else:
+        values["tolerance"] = tolerance
+
+    return values, problems
+
+
+def hk_warnings(runs, params, n_train):
+    """Plain-language warnings for boundaries that still misclassify training records."""
+    unresolved = [r for r in runs if r["train_errors"] > 0]
+    if not unresolved:
+        return []
+    if len(runs) == 1:
+        r = runs[0]
+        wrong = f"{r['train_errors']} of {n_train} training records"
+        if r["status"] == "not_separable":
+            return [
+                "Ho-Kashyap shows these two classes cannot be separated by a straight boundary "
+                f"({wrong} stay on the wrong side). The classifier uses the best compromise it "
+                "found, so expect mistakes."
+            ]
+        return [
+            f"Ho-Kashyap reached the {params['max_iterations']:,}-iteration limit with {wrong} still on the "
+            "wrong side. The classes may not be linearly separable; the classifier uses the best boundary "
+            "found so far."
+        ]
+    return [
+        f"{len(unresolved)} of {len(runs)} one-vs-rest boundaries still misclassify training records, so "
+        "those classes are not (or not yet shown to be) linearly separable from the rest. The classifier "
+        "uses the best compromise found for each."
+    ]
+
+
+def train_ho_kashyap(split, test_size, params):
+    X_train = split["X_train"]
+    n_train = len(X_train)
+    train_classes = int(split["y_train"].nunique())
+    n_boundaries = 1 if train_classes == 2 else train_classes
+    width = 1 + len(split["numeric"]) + sum(int(X_train[c].nunique()) for c in split["categorical"])
+
+    # Each iteration is two matrix-vector products per boundary; refuse settings
+    # that would keep the server busy for minutes.
+    work = params["max_iterations"] * n_boundaries * n_train * width
+    if work > HK_MAX_WORK:
+        affordable = int(HK_MAX_WORK // (n_boundaries * n_train * width))
+        advice = (
+            f"Lower the maximum iterations to about {affordable:,} or less."
+            if affordable >= 10 else "Use fewer records or fewer features."
+        )
+        return jsonify({"errors": [
+            f"Ho-Kashyap with {params['max_iterations']:,} iterations would take too long on {n_train:,} "
+            f"training records with {width} encoded columns and {n_boundaries} "
+            f"{'boundary' if n_boundaries == 1 else 'boundaries'}. {advice}"
+        ]}), 400
+
+    try:
+        model = HoKashyapClassifier(split["numeric"], split["categorical"], **params).fit(
+            X_train, split["y_train"]
+        )
+        y_pred = model.predict(split["X_test"])
+        training_accuracy = float((model.predict(X_train) == split["y_train"].to_numpy()).mean())
+    except Exception as exc:
+        return jsonify({"errors": [f"Training failed: {exc}"]}), 500
+
+    labels = split["labels"]
+    index = pd.Index(labels)
+    ev = evaluate_predictions(index.get_indexer(split["y_test"]), index.get_indexer(y_pred), len(labels))
+
+    fields = split_fields(split, test_size)
+    model_id = new_model_id()
+    STATE["model"] = {
+        "algorithm": "ho_kashyap",
+        "label": ALGORITHMS["ho_kashyap"],
+        "model_id": model_id,
+        "clf": model,
+        "features": split["X"].columns.tolist(),
+        "numeric": split["numeric"],
+        "categorical": split["categorical"],
+        "schema": fields["schema"],
+    }
+
+    return jsonify({
+        **fields,
+        "algorithm": ALGORITHMS["ho_kashyap"],
+        "algorithm_key": "ho_kashyap",
+        "model_id": model_id,
+        "n_dimensions": int(model.n_dimensions_),
+        "training_accuracy": r4(training_accuracy),
+        "metrics": {**metric_fields(ev), "average": "weighted"},
+        "per_class": per_class_rows(labels, ev),
+        "confusion_matrix": ev["confusion_matrix"].tolist(),
+        "convergence": {
+            "mode": "binary" if len(model.runs_) == 1 else "one_vs_rest",
+            "parameters": params,
+            "n_train": n_train,
+            "discriminants": [
+                {**r, "max_error": round_sig(r["max_error"]), "criterion": round_sig(r["criterion"])}
+                for r in model.runs_
+            ],
+        },
+        "warnings": split["warnings"] + hk_warnings(model.runs_, params, n_train),
+    })
+
+
+# --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
 @app.route("/")
@@ -546,6 +692,8 @@ def home():
         test_sizes=TEST_SIZES,
         default_test_size=DEFAULT_TEST_SIZE,
         max_k=MAX_K,
+        hk_defaults=HK_DEFAULTS,
+        hk_max_iterations=HK_MAX_ITERATIONS,
     )
 
 
@@ -661,6 +809,12 @@ def train():
     if not 0.05 <= test_size <= 0.5:
         return jsonify({"errors": ["Test split must be between 5% and 50%."]}), 400
 
+    hk_params = None
+    if algorithm == "ho_kashyap":
+        hk_params, problems = parse_hk_params(payload.get("params"))
+        if problems:
+            return jsonify({"errors": problems}), 400
+
     if algorithm == "knn":
         ks, problem = parse_ks(payload.get("params"))
         if problem:
@@ -701,6 +855,8 @@ def train():
     split, error = prepare_split(df, target_name, test_size)
     if error:
         return error
+    if algorithm == "ho_kashyap":
+        return train_ho_kashyap(split, test_size, hk_params)
     return train_naive_bayes(split, test_size)
 
 
@@ -807,6 +963,33 @@ def predict():
 
     X_new = pd.DataFrame([row], columns=bundle["features"])
     model = bundle["clf"]
+
+    if bundle["algorithm"] == "ho_kashyap":
+        try:
+            scores = model.decision_scores(X_new)[0]
+        except Exception as exc:
+            return jsonify({"errors": [f"Prediction failed: {exc}"]}), 500
+        order = sorted(range(len(scores)), key=lambda i: -scores[i])  # stable: ties keep class order
+        if len(scores) == 2:
+            explanation = (
+                f"Ho-Kashyap linear discriminant. g(x) = {scores[1]:+.3f}: positive values choose "
+                f"'{model.classes_[1]}', negative values choose '{model.classes_[0]}'. The scores are "
+                "-g(x) and +g(x), not probabilities."
+            )
+        else:
+            explanation = (
+                "Ho-Kashyap with one boundary per class (one-vs-rest). Each score is that class's "
+                "discriminant value and the highest score wins. Scores are not probabilities."
+            )
+        return jsonify({
+            "prediction": str(model.classes_[order[0]]),
+            "scores": [{"label": str(model.classes_[i]), "score": round(float(scores[i]), 6)} for i in order],
+            "filled_columns": blank,
+            "model": bundle["label"],
+            "k": None,
+            "explanation": explanation,
+        })
+
     try:
         if bundle["algorithm"] == "knn":
             votes = model.vote_counts(X_new, k)

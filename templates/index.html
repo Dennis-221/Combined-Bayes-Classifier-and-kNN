@@ -20,7 +20,7 @@
 
     <main class="page__main">
       <div class="intro">
-        <h1>Train a Bayes classifier.</h1>
+        <h1>Train the classifier of Your choice.</h1>
         <p>Upload a CSV, choose the column you want to predict, then train, evaluate and use a Naive Bayes model, one step at a time.</p>
       </div>
 
@@ -182,6 +182,27 @@
           <p class="block-note">Each value of k you run is recorded with its test error rate; run again to add more. Odd values avoid ties in two-class problems. When classes tie, the class that sorts first wins.</p>
         </div>
 
+        <div class="hk-options" id="hkOptions" hidden>
+          <p class="block-note block-note--flush">Ho-Kashyap searches for a straight (linear) boundary that separates the classes. With more than two classes it trains one boundary per class against all the others. Numeric features are standardized and categorical features one-hot encoded.</p>
+          <div class="field-row">
+            <div class="field">
+              <label class="field__label" for="hkRate">Learning rate</label>
+              <input class="control" id="hkRate" type="number" step="any" min="0.01" max="0.99" value="{{ hk_defaults.learning_rate }}" />
+              <span class="field__hint">Greater than 0 and less than 1.</span>
+            </div>
+            <div class="field">
+              <label class="field__label" for="hkIterations">Maximum iterations</label>
+              <input class="control" id="hkIterations" type="number" step="1" min="1" max="{{ hk_max_iterations }}" value="{{ hk_defaults.max_iterations }}" />
+              <span class="field__hint">Training stops here if it has not converged.</span>
+            </div>
+            <div class="field">
+              <label class="field__label" for="hkTolerance">Convergence threshold</label>
+              <input class="control" id="hkTolerance" type="number" step="any" min="0.000001" max="0.5" value="{{ hk_defaults.tolerance }}" />
+              <span class="field__hint">Training stops once every error is below this.</span>
+            </div>
+          </div>
+        </div>
+
         <button class="jumbotron-btn" id="trainBtn" type="button" disabled>
           <span class="jumbotron-btn__label" id="trainBtnLabel">Train model</span>
           <span class="jumbotron-btn__sub" id="trainBtnSub">Fit on the training split, then evaluate on the test split</span>
@@ -222,6 +243,14 @@
                 <div id="knnCompare"></div>
                 <p class="block-note">Error change is measured against the elbow k in percentage points of the test split. Negative means fewer mistakes than the elbow.</p>
               </div>
+            </div>
+          </div>
+
+          <div id="hkBlocks" hidden>
+            <div class="block">
+              <h3 class="block-title" id="hkTitle">Convergence</h3>
+              <div id="hkConvergence"></div>
+              <div id="hkConvergenceNote"></div>
             </div>
           </div>
 
@@ -278,6 +307,7 @@
           <span class="prediction__label">Predicted class</span>
           <span class="prediction__value" id="predictValue"></span>
           <div class="bars" id="predictBars"></div>
+          <div id="predictScores" hidden></div>
           <p class="block-note" id="predictExplain"></p>
           <p class="block-note" id="predictNote" hidden></p>
         </div>
