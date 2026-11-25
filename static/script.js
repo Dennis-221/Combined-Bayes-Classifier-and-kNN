@@ -148,7 +148,10 @@ function setLocked(sectionId, locked) {
   if (!locked && sectionId === "targetSection") {
     $("analyzeBtn").disabled = !$("targetSelect").value;
   }
-  if (!locked && sectionId === "trainSection") syncKGrid();
+  if (!locked && sectionId === "trainSection") {
+    syncKGrid();
+    syncParzenWidth();
+  }
 }
 
 // Runs a button's action with a loading state. The button stays disabled
@@ -190,6 +193,7 @@ function clearTrain() {
   $("knnBlocks").hidden = true;
   $("knnPlotResult").hidden = true;
   $("hkBlocks").hidden = true;
+  $("parzenBlocks").hidden = true;
   hideInline($("plotError"));
   knnData = null;
   renderNotices($("trainNotices"));
@@ -630,12 +634,45 @@ const ALGORITHM_BUTTON = {
   naive_bayes: ["Train model", "Fit on the training split, then evaluate on the test split"],
   knn: ["Run KNN", "Record the test error rate for each selected k"],
   ho_kashyap: ["Train Ho-Kashyap", "Find a linear boundary on the training split, then evaluate it on the test split"],
+  parzen: ["Train Parzen window", "Estimate each class's density, then evaluate on the test split"],
 };
+
+const PARZEN_HINT = {
+  gaussian: "Smooth bell-shaped window. Every record is always covered, so no record is left undecided.",
+  epanechnikov: "Round window that fades to zero at its edge. A record can fall outside every window.",
+  hypercube: "A box whose sides equal the width; each training record inside counts equally. A record can fall outside every window.",
+};
+
+// "Choose automatically" keeps the width field disabled (locking the section disables it too).
+// While it is on, the field is blank with an "automatic" placeholder rather than showing a number
+// that would not be used; your last manual width comes back when you untick it.
+let manualWidth = $("parzenWidth").value;
+
+function syncParzenWidth() {
+  const field = $("parzenWidth");
+  const auto = $("parzenAuto").checked;
+  if (auto && field.value !== "") {
+    manualWidth = field.value;
+    field.value = "";
+  } else if (!auto && field.value === "") {
+    field.value = manualWidth;
+  }
+  field.placeholder = auto ? "automatic" : "";
+  field.disabled = $("trainSection").classList.contains("is-locked") || auto;
+}
+
+function syncParzenHint() {
+  $("parzenKernelHint").textContent = PARZEN_HINT[$("parzenKernel").value];
+}
+
+$("parzenAuto").addEventListener("change", syncParzenWidth);
+$("parzenKernel").addEventListener("change", syncParzenHint);
 
 function onAlgorithmChange() {
   const algorithm = $("algorithmSelect").value;
   $("knnOptions").hidden = algorithm !== "knn";
   $("hkOptions").hidden = algorithm !== "ho_kashyap";
+  $("parzenOptions").hidden = algorithm !== "parzen";
   const [label, sub] = ALGORITHM_BUTTON[algorithm];
   $("trainBtnLabel").textContent = label;
   $("trainBtnSub").textContent = sub;
@@ -650,7 +687,9 @@ $("testSizeSelect").addEventListener("change", () => {
   clearTrain();
 });
 onAlgorithmChange();
+syncParzenHint();
 syncKGrid();
+syncParzenWidth();
 
 /* ============================================================
    04 Naive Bayes
@@ -662,6 +701,7 @@ function renderTrain(data) {
   $("knnBlocks").hidden = true;
   $("knnPlotResult").hidden = true;
   $("hkBlocks").hidden = true;
+  $("parzenBlocks").hidden = true;
   $("detailKField").hidden = true;
 
   renderNotices($("trainNotices"), { warnings: data.warnings });
@@ -783,6 +823,7 @@ function renderKnn(data) {
   );
 
   $("hkBlocks").hidden = true;
+  $("parzenBlocks").hidden = true;
   $("knnBlocks").hidden = false;
   renderKnnRecords(data);
 
@@ -1160,6 +1201,7 @@ const HK_EXPLANATION = {
 function renderHoKashyap(data) {
   activeAlgorithm = "ho_kashyap";
   knnData = null;
+  $("parzenBlocks").hidden = true;
   $("knnBlocks").hidden = true;
   $("knnPlotResult").hidden = true;
   $("detailKField").hidden = true;
@@ -1235,6 +1277,55 @@ function renderHoKashyap(data) {
 }
 
 /* ============================================================
+   04 Parzen window
+   ============================================================ */
+
+function renderParzen(data) {
+  activeAlgorithm = "parzen";
+  knnData = null;
+  $("knnBlocks").hidden = true;
+  $("knnPlotResult").hidden = true;
+  $("hkBlocks").hidden = true;
+  $("detailKField").hidden = true;
+
+  renderNotices($("trainNotices"), { warnings: data.warnings });
+  $("trainStats").replaceChildren(
+    statCard(num(data.n_train), "training samples"),
+    statCard(num(data.n_test), "testing samples", "info"),
+    statCard(num(data.n_features), "features used"),
+    statCard(num(data.n_dimensions), "dimensions after encoding")
+  );
+  $("trainSplitNote").textContent = splitNote(data, `${data.algorithm}.`);
+
+  const w = data.window;
+  $("parzenWindow").replaceChildren(
+    statCard(w.kernel_label, "window function"),
+    statCard(String(parseFloat(Number(w.bandwidth).toPrecision(3))), `window width (${w.automatic ? "chosen automatically" : "set by you"})`),
+    statCard(`${num(w.empty_windows)} of ${num(w.n_test)}`, "test records with an empty window", w.empty_windows ? "warn" : null)
+  );
+  $("parzenNote").textContent =
+    "Each class is scored by the total window weight of its training records around the record being classified, " +
+    "which is the Bayes decision rule with the class frequencies as priors. " +
+    PARZEN_HINT[w.kernel] +
+    " Width is in standardized units; a very small width makes it behave like 1-nearest-neighbor and a very large one " +
+    "pushes every record toward the most common class.";
+  $("parzenBlocks").hidden = false;
+
+  renderPerformance({
+    title: "Performance on the test split",
+    metrics: data.metrics,
+    baseline: data.baseline_accuracy,
+    perClass: data.per_class,
+    labels: data.labels,
+    matrix: data.confusion_matrix,
+  });
+  $("trainResult").hidden = false;
+
+  ensurePredictForm(data);
+  setLocked("predictSection", false);
+}
+
+/* ============================================================
    04 Train button (all algorithms)
    ============================================================ */
 
@@ -1253,6 +1344,12 @@ $("trainBtn").addEventListener("click", () =>
           return;
         }
         payload.params = { ks };
+      } else if (algorithm === "parzen") {
+        // a null width means "choose automatically"; a typed-in one is sent as text so an empty field is rejected
+        payload.params = {
+          kernel: $("parzenKernel").value,
+          bandwidth: $("parzenAuto").checked ? null : $("parzenWidth").value,
+        };
       } else if (algorithm === "ho_kashyap") {
         // an emptied field becomes NaN -> null, which the server reports as invalid
         payload.params = {
@@ -1278,6 +1375,8 @@ $("trainBtn").addEventListener("click", () =>
         if (!$("knnPlotResult").hidden) await loadCurve();
       } else if (data.algorithm_key === "ho_kashyap") {
         renderHoKashyap(data);
+      } else if (data.algorithm_key === "parzen") {
+        renderParzen(data);
       } else {
         renderTrain(data);
       }

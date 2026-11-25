@@ -8,6 +8,7 @@ ALGORITHMS in app.py.
 
 import numpy as np
 import pandas as pd
+from scipy.spatial.distance import cdist
 from scipy.special import logsumexp
 from sklearn.naive_bayes import CategoricalNB, GaussianNB
 from sklearn.neighbors import NearestNeighbors
@@ -113,9 +114,43 @@ class MixedNaiveBayes(_MixedFeatures):
 
 
 # --------------------------------------------------------------------------
+# Shared distance-space encoding (K-nearest neighbours and Parzen window)
+# --------------------------------------------------------------------------
+class _DistanceSpace(_MixedFeatures):
+    """Encoding for methods that compare records by distance.
+
+    * numeric features     -> median-filled, then z-scored
+    * categorical features -> most-frequent-filled, then one-hot encoded. Each
+      feature gets one extra all-zero column in training that lights up for a
+      category first seen at prediction time, so an unseen category counts as a
+      mismatch against every training record.
+    """
+
+    def _fit_levels(self, X):
+        frame = self._categorical_frame(X)
+        self.cat_levels_ = {
+            col: {value: i for i, value in enumerate(sorted(frame[col].unique()))}
+            for col in self.categorical
+        }
+
+    def _encode(self, X):
+        blocks = []
+        if self.numeric:
+            blocks.append(self._scaled_numeric(X))
+        if self.categorical:
+            frame = self._categorical_frame(X)
+            for col in self.categorical:
+                levels = self.cat_levels_[col]
+                n_levels = len(levels)
+                codes = frame[col].map(levels).fillna(n_levels).astype(int).to_numpy()
+                blocks.append(np.eye(n_levels + 1)[codes])
+        return np.hstack(blocks)
+
+
+# --------------------------------------------------------------------------
 # K-nearest neighbours
 # --------------------------------------------------------------------------
-class KNNClassifier(_MixedFeatures):
+class KNNClassifier(_DistanceSpace):
     """K-nearest neighbours on mixed features, with Euclidean distance.
 
     * numeric features     -> median-filled, then z-scored
@@ -138,28 +173,11 @@ class KNNClassifier(_MixedFeatures):
         self.n_train_ = len(y)
 
         self._fit_features(X)
-        frame = self._categorical_frame(X)
-        self.cat_levels_ = {
-            col: {value: i for i, value in enumerate(sorted(frame[col].unique()))}
-            for col in self.categorical
-        }
+        self._fit_levels(X)
         encoded = self._encode(X)
         self.n_dimensions_ = encoded.shape[1]
         self.nn_ = NearestNeighbors(metric="euclidean").fit(encoded)
         return self
-
-    def _encode(self, X):
-        blocks = []
-        if self.numeric:
-            blocks.append(self._scaled_numeric(X))
-        if self.categorical:
-            frame = self._categorical_frame(X)
-            for col in self.categorical:
-                levels = self.cat_levels_[col]
-                n_levels = len(levels)
-                codes = frame[col].map(levels).fillna(n_levels).astype(int).to_numpy()
-                blocks.append(np.eye(n_levels + 1)[codes])
-        return np.hstack(blocks)
 
     def predict_indices(self, X, ks):
         """Predicted class index for every row of X, for each k in ks.
@@ -186,6 +204,123 @@ class KNNClassifier(_MixedFeatures):
         for a single-row frame X. Returns an array aligned with classes_."""
         _, neighbours = self.nn_.kneighbors(self._encode(X), n_neighbors=int(k))
         return np.bincount(self.train_class_idx_[neighbours[0]], minlength=len(self.classes_))
+
+
+# --------------------------------------------------------------------------
+# Parzen window
+# --------------------------------------------------------------------------
+PARZEN_KERNELS = ("gaussian", "epanechnikov", "hypercube")
+
+
+class ParzenWindowClassifier(_DistanceSpace):
+    """Parzen window (kernel density) classifier.
+
+    Each class's density is estimated by placing a window of width h on every
+    training record of that class. A record is given to the class with the
+    largest posterior, with class frequencies as priors. The prior P(c) = n_c / n
+    cancels the 1/n_c in the density estimate, so the rule reduces to:
+
+        choose the class whose training records put the most total window weight
+        around the record being classified.
+
+    Windows (u is the distance to a training record divided by the width h):
+
+    * "gaussian"      exp(-u^2 / 2), Euclidean distance. Never exactly zero, and
+                      evaluated in the log domain so it cannot underflow.
+    * "epanechnikov"  max(0, 1 - u^2), Euclidean distance.
+    * "hypercube"     1 inside a box of side h centred on the training record
+                      (max-norm), else 0: the classic textbook window.
+
+    The compact windows can be empty: no training record inside the window of
+    a record being classified. That record is given the class of its nearest
+    training record, and `window_probabilities` reports which records it
+    happened to, so the caller can tell the user the window was too narrow.
+
+    With bandwidth=None the width comes from Silverman's rule of thumb for data
+    with unit variance (which is what z-scoring produces).
+    """
+
+    def __init__(self, numeric, categorical, kernel="gaussian", bandwidth=None):
+        super().__init__(numeric, categorical)
+        if kernel not in PARZEN_KERNELS:
+            raise ValueError(f"kernel must be one of {', '.join(PARZEN_KERNELS)}")
+        if bandwidth is not None and not bandwidth > 0:
+            raise ValueError("bandwidth must be greater than 0")
+        self.kernel = kernel
+        self.bandwidth = bandwidth
+        self.chunk_cells = 4_000_000  # distance-matrix cells held in memory at once
+
+    def fit(self, X, y):
+        y = np.asarray(y, dtype=str)
+        self.classes_ = np.unique(y)
+        self.train_class_idx_ = np.searchsorted(self.classes_, y)
+        self.class_columns_ = [
+            np.flatnonzero(self.train_class_idx_ == c) for c in range(len(self.classes_))
+        ]
+
+        self._fit_features(X)
+        self._fit_levels(X)
+        self.train_points_ = self._encode(X)
+        self.n_dimensions_ = self.train_points_.shape[1]
+
+        if self.bandwidth is None:
+            # the all-zero "unseen category" columns add no spread, so don't count them
+            d = max(1, self.n_dimensions_ - len(self.categorical))
+            n = len(y)
+            self.bandwidth_ = float((4.0 / (d + 2)) ** (1.0 / (d + 4)) * n ** (-1.0 / (d + 4)))
+        else:
+            self.bandwidth_ = float(self.bandwidth)
+        return self
+
+    def _block_probabilities(self, block):
+        h = self.bandwidth_
+        if self.kernel == "gaussian":
+            log_weight = cdist(block, self.train_points_, "sqeuclidean") / (-2.0 * h * h)
+            log_score = np.column_stack(
+                [logsumexp(log_weight[:, cols], axis=1) for cols in self.class_columns_]
+            )
+            proba = np.exp(log_score - logsumexp(log_score, axis=1, keepdims=True))
+            return proba, np.zeros(len(block), dtype=bool)
+
+        if self.kernel == "epanechnikov":
+            distance = cdist(block, self.train_points_, "sqeuclidean")
+            weight = np.maximum(0.0, 1.0 - distance / (h * h))
+        else:  # hypercube
+            distance = cdist(block, self.train_points_, "chebyshev")
+            weight = (distance <= h / 2.0).astype(float)
+
+        score = np.column_stack([weight[:, cols].sum(axis=1) for cols in self.class_columns_])
+        total = score.sum(axis=1)
+        empty = total <= 0.0
+        proba = np.zeros_like(score)
+        np.divide(score, total[:, None], out=proba, where=~empty[:, None])
+        if empty.any():
+            rows = np.flatnonzero(empty)
+            nearest = self.train_class_idx_[distance[rows].argmin(axis=1)]
+            proba[rows, nearest] = 1.0
+        return proba, empty
+
+    def window_probabilities(self, X):
+        """(posterior, empty_window) for every row of X.
+
+        posterior       rows sum to 1, columns aligned with classes_
+        empty_window    True where no training record fell inside the window and
+                        the nearest training record decided instead
+        """
+        points = self._encode(X)
+        step = max(1, int(self.chunk_cells // max(1, len(self.train_points_))))
+        proba = np.empty((len(points), len(self.classes_)))
+        empty = np.zeros(len(points), dtype=bool)
+        for start in range(0, len(points), step):
+            stop = start + step
+            proba[start:stop], empty[start:stop] = self._block_probabilities(points[start:stop])
+        return proba, empty
+
+    def predict_proba(self, X):
+        return self.window_probabilities(X)[0]
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.window_probabilities(X)[0], axis=1)]
 
 
 # --------------------------------------------------------------------------

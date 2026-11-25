@@ -6,7 +6,14 @@ import pandas as pd
 from flask import Flask, jsonify, render_template, request
 from sklearn.model_selection import train_test_split
 
-from models import HoKashyapClassifier, KNNClassifier, MixedNaiveBayes, choose_k, evaluate_predictions
+from models import (
+    HoKashyapClassifier,
+    KNNClassifier,
+    MixedNaiveBayes,
+    ParzenWindowClassifier,
+    choose_k,
+    evaluate_predictions,
+)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB upload cap
@@ -23,6 +30,15 @@ SLOW_KNN_ROWS = 50_000    # KNN: warn above this many training records
 HK_DEFAULTS = {"learning_rate": 0.5, "max_iterations": 5000, "tolerance": 0.001}
 HK_MAX_ITERATIONS = 100_000
 HK_MAX_WORK = 2e10        # Ho-Kashyap: refuse settings that would run for minutes
+PARZEN_WINDOWS = {        # Parzen window: key -> label shown in the UI
+    "gaussian": "Gaussian",
+    "epanechnikov": "Epanechnikov",
+    "hypercube": "Hypercube (box)",
+}
+PARZEN_DEFAULT_KERNEL = "gaussian"
+PARZEN_DEFAULT_WIDTH = 0.5          # starting value of the manual width field
+PARZEN_WIDTH_RANGE = (0.001, 100.0)
+PARZEN_MAX_WORK = 1e10    # test records x training records x columns; above this it would run for minutes
 RANDOM_STATE = 42
 TEST_SIZES = (0.1, 0.2, 0.25, 0.3)
 DEFAULT_TEST_SIZE = 0.2
@@ -33,6 +49,7 @@ ALGORITHMS = {
     "naive_bayes": "Naive Bayes (Gaussian + Categorical)",
     "knn": "K-nearest neighbors (KNN)",
     "ho_kashyap": "Ho-Kashyap (linear discriminant)",
+    "parzen": "Parzen window (kernel density)",
 }
 DEFAULT_ALGORITHM = "naive_bayes"
 
@@ -682,6 +699,105 @@ def train_ho_kashyap(split, test_size, params):
 
 
 # --------------------------------------------------------------------------
+# Parzen window
+# --------------------------------------------------------------------------
+def parse_parzen_params(params):
+    """Validate the Parzen window settings. Returns (values, problems).
+    A missing or null bandwidth means "choose it automatically"."""
+    raw = params if isinstance(params, dict) else {}
+    values, problems = {}, []
+
+    kernel = raw.get("kernel", PARZEN_DEFAULT_KERNEL)
+    if isinstance(kernel, str) and kernel in PARZEN_WINDOWS:
+        values["kernel"] = kernel
+    else:
+        problems.append("Window function must be one of: " + ", ".join(PARZEN_WINDOWS) + ".")
+
+    width = raw.get("bandwidth")
+    if width is None:
+        values["bandwidth"] = None
+    else:
+        number = as_number(width)
+        low, high = PARZEN_WIDTH_RANGE
+        if number is None or not low <= number <= high:
+            problems.append(f"Window width must be a number from {low:g} to {high:g}, or left on automatic.")
+        else:
+            values["bandwidth"] = number
+
+    return values, problems
+
+
+def train_parzen(split, test_size, params):
+    X_train = split["X_train"]
+    n_train, n_test = len(X_train), len(split["X_test"])
+    columns = len(split["numeric"]) + sum(int(X_train[c].nunique()) + 1 for c in split["categorical"])
+
+    # Every test record is compared with every training record; refuse sizes that
+    # would keep the server busy for minutes.
+    if n_train * n_test * max(1, columns) > PARZEN_MAX_WORK:
+        return jsonify({"errors": [
+            f"Parzen window compares every test record with every training record, and "
+            f"{n_test:,} x {n_train:,} records across {columns} encoded columns is too many. "
+            "Use a smaller test split, fewer records or fewer features."
+        ]}), 400
+
+    try:
+        model = ParzenWindowClassifier(split["numeric"], split["categorical"], **params).fit(
+            X_train, split["y_train"]
+        )
+        proba, empty = model.window_probabilities(split["X_test"])
+    except Exception as exc:
+        return jsonify({"errors": [f"Training failed: {exc}"]}), 500
+    y_pred = model.classes_[proba.argmax(axis=1)]
+
+    labels = split["labels"]
+    index = pd.Index(labels)
+    ev = evaluate_predictions(index.get_indexer(split["y_test"]), index.get_indexer(y_pred), len(labels))
+
+    n_empty = int(empty.sum())
+    warnings = list(split["warnings"])
+    if n_empty:
+        warnings.append(
+            f"{n_empty} of {n_test} test records had no training record inside the window, so the nearest "
+            "training record decided. Widen the window, or use the Gaussian window, which always covers "
+            "every record."
+        )
+
+    fields = split_fields(split, test_size)
+    model_id = new_model_id()
+    STATE["model"] = {
+        "algorithm": "parzen",
+        "label": ALGORITHMS["parzen"],
+        "model_id": model_id,
+        "clf": model,
+        "features": split["X"].columns.tolist(),
+        "numeric": split["numeric"],
+        "categorical": split["categorical"],
+        "schema": fields["schema"],
+    }
+
+    return jsonify({
+        **fields,
+        "algorithm": ALGORITHMS["parzen"],
+        "algorithm_key": "parzen",
+        "model_id": model_id,
+        "n_dimensions": int(model.n_dimensions_),
+        "metrics": {**metric_fields(ev), "average": "weighted"},
+        "per_class": per_class_rows(labels, ev),
+        "confusion_matrix": ev["confusion_matrix"].tolist(),
+        "window": {
+            "kernel": params["kernel"],
+            "kernel_label": PARZEN_WINDOWS[params["kernel"]],
+            "bandwidth": round_sig(model.bandwidth_),
+            "automatic": params["bandwidth"] is None,
+            "empty_windows": n_empty,
+            "n_test": n_test,
+        },
+        "warnings": warnings,
+    })
+
+
+# --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
 @app.route("/")
@@ -694,6 +810,10 @@ def home():
         max_k=MAX_K,
         hk_defaults=HK_DEFAULTS,
         hk_max_iterations=HK_MAX_ITERATIONS,
+        parzen_windows=list(PARZEN_WINDOWS.items()),
+        parzen_default_width=PARZEN_DEFAULT_WIDTH,
+        parzen_min_width=PARZEN_WIDTH_RANGE[0],
+        parzen_max_width=PARZEN_WIDTH_RANGE[1],
     )
 
 
@@ -815,6 +935,12 @@ def train():
         if problems:
             return jsonify({"errors": problems}), 400
 
+    parzen_params = None
+    if algorithm == "parzen":
+        parzen_params, problems = parse_parzen_params(payload.get("params"))
+        if problems:
+            return jsonify({"errors": problems}), 400
+
     if algorithm == "knn":
         ks, problem = parse_ks(payload.get("params"))
         if problem:
@@ -857,6 +983,8 @@ def train():
         return error
     if algorithm == "ho_kashyap":
         return train_ho_kashyap(split, test_size, hk_params)
+    if algorithm == "parzen":
+        return train_parzen(split, test_size, parzen_params)
     return train_naive_bayes(split, test_size)
 
 
@@ -963,6 +1091,7 @@ def predict():
 
     X_new = pd.DataFrame([row], columns=bundle["features"])
     model = bundle["clf"]
+    empty_window = False
 
     if bundle["algorithm"] == "ho_kashyap":
         try:
@@ -1004,6 +1133,21 @@ def predict():
                     f"K-nearest neighbors with k = {k}. Each bar shows how many of the {k} nearest "
                     "training records belong to that class."
                 )
+        elif bundle["algorithm"] == "parzen":
+            votes = None
+            window_proba, empty = model.window_probabilities(X_new)
+            proba = window_proba[0]
+            empty_window = bool(empty[0])
+            explanation = (
+                f"Parzen window with a {PARZEN_WINDOWS[model.kernel]} window of width "
+                f"{model.bandwidth_:.3g}. Each bar is that class's share of the total window weight "
+                "around this record."
+            )
+            if empty_window:
+                explanation += (
+                    " No training record fell inside the window, so the class of the nearest "
+                    "training record is shown."
+                )
         else:
             votes = None
             proba = model.predict_proba(X_new)[0]
@@ -1028,6 +1172,7 @@ def predict():
         "filled_columns": blank,
         "model": bundle["label"],
         "k": k,
+        "empty_window": empty_window,
         "explanation": explanation,
     })
 

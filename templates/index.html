@@ -20,7 +20,7 @@
 
     <main class="page__main">
       <div class="intro">
-        <h1>Train the classifier of Your choice.</h1>
+        <h1>Train Classifier of Your Choice.</h1>
         <p>Upload a CSV, choose the column you want to predict, then train, evaluate and use a Naive Bayes model, one step at a time.</p>
       </div>
 
@@ -203,6 +203,27 @@
           </div>
         </div>
 
+        <div class="parzen-options" id="parzenOptions" hidden>
+          <p class="block-note block-note--flush">A Parzen window classifier estimates each class's density by placing a small window on every training record. A record goes to the class with the most window weight around it, weighted by how common the class is. Numeric features are standardized and categorical features one-hot encoded, and distances are measured in that space.</p>
+          <div class="field-row">
+            <div class="field">
+              <label class="field__label" for="parzenKernel">Window function</label>
+              <select class="control" id="parzenKernel">
+                {% for key, label in parzen_windows %}
+                <option value="{{ key }}">{{ label }}</option>
+                {% endfor %}
+              </select>
+              <span class="field__hint" id="parzenKernelHint"></span>
+            </div>
+            <div class="field">
+              <label class="field__label" for="parzenWidth">Window width</label>
+              <input class="control" id="parzenWidth" type="number" step="any" min="{{ parzen_min_width }}" max="{{ parzen_max_width }}" value="{{ parzen_default_width }}" disabled />
+              <label class="check"><input type="checkbox" id="parzenAuto" checked /> Choose automatically (Silverman's rule)</label>
+              <span class="field__hint">In standardized units, where each numeric feature has a standard deviation of 1.</span>
+            </div>
+          </div>
+        </div>
+
         <button class="jumbotron-btn" id="trainBtn" type="button" disabled>
           <span class="jumbotron-btn__label" id="trainBtnLabel">Train model</span>
           <span class="jumbotron-btn__sub" id="trainBtnSub">Fit on the training split, then evaluate on the test split</span>
@@ -251,6 +272,14 @@
               <h3 class="block-title" id="hkTitle">Convergence</h3>
               <div id="hkConvergence"></div>
               <div id="hkConvergenceNote"></div>
+            </div>
+          </div>
+
+          <div id="parzenBlocks" hidden>
+            <div class="block">
+              <h3 class="block-title">Window used</h3>
+              <div class="stats-row stats-row--tight" id="parzenWindow"></div>
+              <p class="block-note" id="parzenNote"></p>
             </div>
           </div>
 
